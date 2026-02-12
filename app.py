@@ -348,7 +348,17 @@ Respond now with your assessment.
             result = response.json() if response.status_code == 200 else None
             if result and result.get("ok"):
                 spawn_info = result.get("result", {})
-                session_key = spawn_info.get("childSessionKey", "unknown")
+                # CRITICAL FIX: childSessionKey is in details object, not result directly
+                session_key = spawn_info.get("details", {}).get("childSessionKey", "unknown")
+                
+                # CRITICAL FIX: Update task with agent_session_key
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE tasks SET agent_session_key = ?, updated_at = ? WHERE id = ?",
+                        (session_key, datetime.now().isoformat(), task_id)
+                    )
+                    conn.commit()
+                    print(f"✅ Set agent_session_key for task #{task_id}: {session_key[:30]}..." if session_key != "unknown" else f"⚠️ Session key unknown for task #{task_id}")
                 
                 # Post system comment about the spawn
                 async with httpx.AsyncClient(timeout=5.0) as comment_client:
@@ -790,6 +800,7 @@ class Task(BaseModel):
     board: str
     source_file: Optional[str] = None
     source_ref: Optional[str] = None
+    agent_session_key: Optional[str] = None
     working_agent: Optional[str] = None
 
 # =============================================================================
