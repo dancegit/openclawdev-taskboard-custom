@@ -18,3 +18,4 @@ __pycache__/
 .idea/
 
 *.personalized
+migrate-to-postgres.py
