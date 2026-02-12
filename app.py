@@ -586,15 +586,20 @@ Begin now.
                 # Save session key to database for follow-up messages
                 if session_key:
                     set_task_session(task_id, session_key)
-                
-                async with httpx.AsyncClient(timeout=5.0) as comment_client:
-                    await comment_client.post(
-                        f"http://localhost:18080/api/tasks/{task_id}/comments",
-                        json={
-                            "agent": "System",
-                            "content": f"🤖 **{agent_name}** agent spawned automatically.\n\nSession: `{session_key or 'unknown'}`\nRun ID: `{run_id}`\n\n💬 *Reply to this task and the agent will respond.*"
-                        }
-                    )
+
+                # Try to post comment, but don't fail if it errors
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as comment_client:
+                        await comment_client.post(
+                            f"http://localhost:18080/api/tasks/{task_id}/comments",
+                            json={
+                                "agent": "System",
+                                "content": f"🤖 **{agent_name}** agent spawned automatically.\n\nSession: `{session_key or 'unknown'}`\nRun ID: `{run_id}`\n\n💬 *Reply to this task and the agent will respond.*"
+                            }
+                        )
+                except Exception as comment_error:
+                    print(f"⚠️  Failed to post spawn comment: {comment_error}")
+
                 return result
             else:
                 print(f"❌ Failed to spawn {agent_name}: {response.text}")
@@ -1330,8 +1335,12 @@ class MoveRequest(BaseModel):
     reason: str = None  # Required for Review/Blocked transitions
 
 @app.post("/api/tasks/{task_id}/move")
-async def move_task(task_id: int, status: str = None, agent: str = None, reason: str = None):
+async def move_task(task_id: int, move_request: MoveRequest):
     """Quick move task to a new status with workflow rules."""
+    status = move_request.status
+    agent = move_request.agent
+    reason = move_request.reason
+    now = datetime.now().isoformat()
     now = datetime.now().isoformat()
     
     with get_db() as conn:
