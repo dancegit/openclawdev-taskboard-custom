@@ -1,10 +1,10 @@
-services:
+﻿services:
   taskboard:
     build: .
-    container_name: moltdev-taskboard
+    container_name: signalmatrix-taskboard
     restart: unless-stopped
     ports:
-      - "18080:8080"
+      - "127.0.0.1:18080:8080"  # Bind to localhost only for security
     volumes:
       - ./data:/app/data
       - ./static:/app/static
@@ -12,6 +12,5 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
-      - OPENCLAW_GATEWAY_URL=http://10.0.0.1:18789
     extra_hosts:
       - "host.docker.internal:host-gateway"

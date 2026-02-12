@@ -121,7 +121,9 @@ def verify_internal_only(request: Request):
     client_host = request.client.host if request.client else None
     allowed_hosts = ["127.0.0.1", "localhost", "::1", "172.17.0.1", "host.docker.internal"]
     
-    # Also allow Docker internal IPs (172.x.x.x)
+    # Also allow Docker internal IPs (172.x.x.x and 10.x.x.x)
+    if client_host and (client_host in allowed_hosts or client_host.startswith("172.") or client_host.startswith("10.")):
+        return True
     if client_host and (client_host in allowed_hosts or client_host.startswith("172.")):
         return True
     
@@ -638,7 +640,11 @@ def init_db():
                 due_date TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                board TEXT DEFAULT 'tasks'
+                board TEXT DEFAULT 'tasks',
+                source_file TEXT,
+                source_ref TEXT,
+                agent_session_key TEXT,
+                working_agent TEXT
             )
         """)
         conn.execute("""
@@ -690,6 +696,10 @@ def init_db():
         except:
             pass  # Column already exists
         
+        # FIX: Update any NULL status values to 'Backlog'
+        conn.execute("UPDATE tasks SET status = 'Backlog' WHERE status IS NULL")
+        conn.commit()
+        
         # Chat messages table for persistent command bar history
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -718,37 +728,22 @@ def init_db():
 
 @contextmanager
 def get_db():
-    """Database connection context manager with WAL mode for better concurrency."""
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    """Database connection context manager."""
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # Enable WAL mode for better concurrency (reduces lock contention)
-    conn.execute("PRAGMA journal_mode=WAL")
-    # Set busy timeout to 5 seconds
-    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
     finally:
         conn.close()
 
-def log_activity(task_id: int, action: str, agent: str = None, details: str = None, conn=None):
+def log_activity(task_id: int, action: str, agent: str = None, details: str = None):
     """Log an activity."""
-    if conn is None:
-        # No connection provided, create one
-        with get_db() as conn:
-            conn.execute(
-                "INSERT INTO activity_log (task_id, action, agent, details, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (task_id, action, agent, details, datetime.now().isoformat())
-            )
-    else:
-        # Use existing connection (reduces lock contention)
+    with get_db() as conn:
         conn.execute(
             "INSERT INTO activity_log (task_id, action, agent, details, timestamp) VALUES (?, ?, ?, ?, ?)",
             (task_id, action, agent, details, datetime.now().isoformat())
         )
+        conn.commit()
 
 # =============================================================================
 # MODELS
@@ -774,14 +769,26 @@ class TaskUpdate(BaseModel):
     due_date: Optional[str] = None
     source_file: Optional[str] = None
     source_ref: Optional[str] = None
-    agent_session_key: Optional[str] = None
-    working_agent: Optional[str] = None
+    
+    @field_validator('status')
+    @classmethod
+    def validate_status(cls, v):
+        if v is not None and v not in STATUSES:
+            raise ValueError(f"Invalid status: {v}. Must be one of: {STATUSES}")
+        return v
+    
+    @field_validator('priority')
+    @classmethod
+    def validate_priority(cls, v):
+        if v is not None and v not in PRIORITIES:
+            raise ValueError(f"Invalid priority: {v}. Must be one of: {PRIORITIES}")
+        return v
 
 class Task(BaseModel):
     id: int
     title: str
     description: str
-    status: str
+    status: Optional[str] = "Backlog"
     priority: str
     agent: str
     due_date: Optional[str]
@@ -790,7 +797,7 @@ class Task(BaseModel):
     board: str
     source_file: Optional[str] = None
     source_ref: Optional[str] = None
-    working_agent: Optional[str] = None
+    agent_session_key: Optional[str] = None
 
 # =============================================================================
 # APP
@@ -950,8 +957,7 @@ async def create_task(task: TaskCreate):
         )
         conn.commit()
         task_id = cursor.lastrowid
-        # Log activity using same connection to avoid lock contention
-        log_activity(task_id, "created", task.agent, f"Created: {task.title}", conn=conn)
+        log_activity(task_id, "created", task.agent, f"Created: {task.title}")
         
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         result = dict(row)
@@ -976,7 +982,7 @@ async def update_task(task_id: int, updates: TaskUpdate):
         update_fields = []
         params = []
         
-        for field in ["title", "description", "status", "priority", "agent", "due_date", "source_file", "source_ref", "agent_session_key", "working_agent"]:
+        for field in ["title", "description", "status", "priority", "agent", "due_date", "source_file", "source_ref"]:
             new_value = getattr(updates, field)
             if new_value is not None and new_value != current[field]:
                 update_fields.append(f"{field} = ?")
@@ -991,8 +997,7 @@ async def update_task(task_id: int, updates: TaskUpdate):
             conn.execute(f"UPDATE tasks SET {', '.join(update_fields)} WHERE id = ?", params)
             conn.commit()
             
-            # Log activity using same connection to avoid lock contention
-            log_activity(task_id, "updated", updates.agent or current["agent"], "; ".join(changes), conn=conn)
+            log_activity(task_id, "updated", updates.agent or current["agent"], "; ".join(changes))
         
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         result = dict(row)
@@ -1011,8 +1016,7 @@ async def delete_task(task_id: int):
         
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.commit()
-        # Log activity using same connection to avoid lock contention
-        log_activity(task_id, "deleted", None, f"Deleted: {row['title']}", conn=conn)
+        log_activity(task_id, "deleted", None, f"Deleted: {row['title']}")
     
     # Broadcast to all clients
     await manager.broadcast({"type": "task_deleted", "task_id": task_id})
@@ -1055,8 +1059,7 @@ async def start_work(task_id: int, agent: str):
                 (agent, "In Progress", now, task_id)
             )
             moved = True
-            # Log activity using same connection to avoid lock contention
-            log_activity(task_id, "status_change", agent, f"Auto-moved from {current_status} to In Progress (agent started work)", conn=conn)
+            log_activity(task_id, "status_change", agent, f"Auto-moved from {current_status} to In Progress (agent started work)")
         else:
             conn.execute(
                 "UPDATE tasks SET working_agent = ?, updated_at = ? WHERE id = ?",
@@ -1067,10 +1070,37 @@ async def start_work(task_id: int, agent: str):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         result = dict(row)
     
+    # Auto-spawn agent session when work starts
+    session_key = None
+    if OPENCLAW_ENABLED and agent in AGENT_TO_OPENCLAW_ID:
+        # Check if agent already has an active session for this task
+        existing_session = result.get("agent_session_key")
+        if not existing_session:
+            # Spawn the agent session
+            session_key = await spawn_agent_session(
+                task_id=task_id,
+                task_title=result["title"],
+                task_description=result.get("description", ""),
+                agent_name=agent
+            )
+            if session_key:
+                # Update task with session key
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE tasks SET agent_session_key = ? WHERE id = ?",
+                        (session_key, task_id)
+                    )
+                    conn.commit()
+                print(f"🤖 Auto-spawned {agent} for task #{task_id}, session: {session_key}")
+    
     await manager.broadcast({"type": "work_started", "task_id": task_id, "agent": agent})
     if moved:
         await manager.broadcast({"type": "task_updated", "task": result})
-    return {"status": "working", "task_id": task_id, "agent": agent, "moved_to": "In Progress" if moved else None}
+    
+    response = {"status": "working", "task_id": task_id, "agent": agent, "moved_to": "In Progress" if moved else None}
+    if session_key:
+        response["session_key"] = session_key
+    return response
 
 @app.post("/api/tasks/{task_id}/stop-work")
 async def stop_work(task_id: int, agent: str = None, outcome: str = None, reason: str = None):
@@ -1118,8 +1148,7 @@ async def stop_work(task_id: int, agent: str = None, outcome: str = None, reason
                 "UPDATE tasks SET working_agent = NULL, status = ?, updated_at = ? WHERE id = ?",
                 (new_status, now, task_id)
             )
-            # Log activity using same connection to avoid lock contention
-            log_activity(task_id, "status_change", agent or "Agent", f"Auto-moved to {new_status} (agent stopped work)", conn=conn)
+            log_activity(task_id, "status_change", agent or "Agent", f"Auto-moved to {new_status} (agent stopped work)")
         else:
             conn.execute(
                 "UPDATE tasks SET working_agent = NULL, updated_at = ? WHERE id = ?",
@@ -1139,14 +1168,43 @@ async def stop_work(task_id: int, agent: str = None, outcome: str = None, reason
     return {"status": "stopped", "task_id": task_id, "moved_to": new_status}
 
 class MoveRequest(BaseModel):
-    status: str
-    agent: str = None
-    reason: str = None  # Required for Review/Blocked transitions
+    status: Optional[str] = None
+    agent: Optional[str] = None
+    reason: Optional[str] = None  # Required for Review/Blocked transitions
+    
+    @field_validator('status')
+    @classmethod
+    def validate_status(cls, v):
+        if v is not None and v not in STATUSES:
+            raise ValueError(f"Invalid status: {v}. Must be one of: {STATUSES}")
+        return v
 
 @app.post("/api/tasks/{task_id}/move")
-async def move_task(task_id: int, status: str = None, agent: str = None, reason: str = None):
-    """Quick move task to a new status with workflow rules."""
-    now = datetime.now().isoformat()
+async def move_task(
+    task_id: int,
+    move_data: MoveRequest
+):
+    """Quick move task to a new status with workflow rules.
+    
+    Requires JSON body with MoveRequest structure:
+    - status: str (required) - one of: Backlog, In Progress, Review, Done, Blocked
+    - agent: str (optional) - agent performing the move
+    - reason: str (optional) - reason for Review/Blocked transitions
+    """
+    import sys
+    
+    # Validate required status field
+    if not move_data or not move_data.status:
+        raise HTTPException(status_code=400, detail="Status is required in JSON body")
+    
+    final_status = move_data.status
+    final_agent = move_data.agent
+    final_reason = move_data.reason
+    
+    print(f"📥 Move request: task_id={task_id}, status={final_status}, agent={final_agent}", file=sys.stderr)
+    
+    if final_status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {final_status}. Must be one of: {STATUSES}")
     
     with get_db() as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1155,46 +1213,49 @@ async def move_task(task_id: int, status: str = None, agent: str = None, reason:
         
         task = dict(row)
         old_status = task["status"]
+        now = datetime.now().isoformat()
         
-        # RULE: Only User (human) can move to Done
-        if status == "Done" and agent != "User":
-            raise HTTPException(status_code=403, detail="Only User can move tasks to Done")
+        # Determine effective agent for logging
+        effective_agent = final_agent or task.get("agent") or "SignalMatrix"
+        
+        # RULE: Only User (human) or SignalMatrix (autonomous approval authority) can move to Done
+        if final_status == "Done" and effective_agent not in ["User", "SignalMatrix"]:
+            raise HTTPException(status_code=403, detail="Only User or SignalMatrix can move tasks to Done")
         
         # Update status
         conn.execute(
             "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (status, now, task_id)
+            (final_status, now, task_id)
         )
         conn.commit()
-        # Log activity using same connection to avoid lock contention
-        log_activity(task_id, "moved", agent, f"Moved to {status}", conn=conn)
+        log_activity(task_id, "moved", effective_agent, f"Moved to {final_status}")
         
         # AUTO-CREATE ACTION ITEMS based on transition
         action_item = None
         
         # Moving to Review → create completion action item
-        if status == "Review" and old_status != "Review":
-            content = reason or f"Ready for review: {task['title']}"
+        if final_status == "Review" and old_status != "Review":
+            content = final_reason or f"Ready for review: {task['title']}"
             cursor = conn.execute(
                 "INSERT INTO action_items (task_id, agent, content, item_type, created_at) VALUES (?, ?, ?, ?, ?)",
-                (task_id, agent or task["agent"], content, "completion", now)
+                (task_id, final_agent or task["agent"], content, "completion", now)
             )
             conn.commit()
             action_item = {
-                "id": cursor.lastrowid, "task_id": task_id, "agent": agent or task["agent"],
+                "id": cursor.lastrowid, "task_id": task_id, "agent": final_agent or task["agent"],
                 "content": content, "item_type": "completion", "resolved": 0, "created_at": now
             }
         
         # Moving to Blocked → create blocker action item
-        if status == "Blocked" and old_status != "Blocked":
-            content = reason or f"Blocked: {task['title']} - reason not specified"
+        if final_status == "Blocked" and old_status != "Blocked":
+            content = final_reason or f"Blocked: {task['title']} - reason not specified"
             cursor = conn.execute(
                 "INSERT INTO action_items (task_id, agent, content, item_type, created_at) VALUES (?, ?, ?, ?, ?)",
-                (task_id, agent or task["agent"], content, "blocker", now)
+                (task_id, final_agent or task["agent"], content, "blocker", now)
             )
             conn.commit()
             action_item = {
-                "id": cursor.lastrowid, "task_id": task_id, "agent": agent or task["agent"],
+                "id": cursor.lastrowid, "task_id": task_id, "agent": final_agent or task["agent"],
                 "content": content, "item_type": "blocker", "resolved": 0, "created_at": now
             }
         
@@ -1208,7 +1269,7 @@ async def move_task(task_id: int, status: str = None, agent: str = None, reason:
     
     # CLEANUP: When moving to Done, clear the agent session AND working indicator
     session_cleared = False
-    if status == "Done":
+    if final_status == "Done":
         # Always clear working_agent when task is Done
         with get_db() as conn:
             conn.execute(
@@ -1226,9 +1287,9 @@ async def move_task(task_id: int, status: str = None, agent: str = None, reason:
             # Clear the session from the database
             set_task_session(task_id, None)
             session_cleared = True
-            print(f"🧹 Cleared agent session for task #{task_id}")
+            print(f"🧹 Cleared agent session for task #{task_id}", file=sys.stderr)
     
-    return {"status": "moved", "new_status": status, "action_item_created": action_item is not None, "session_cleared": session_cleared}
+    return {"status": "moved", "new_status": final_status, "action_item_created": action_item is not None, "session_cleared": session_cleared}
 
 # =============================================================================
 # COMMENTS

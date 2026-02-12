@@ -3002,7 +3002,7 @@
         
         async function loadTasks() {
             const agent = document.getElementById('filterAgent').value;
-            const url = agent ? `${API}/api/tasks?agent=${agent}` : `${API}/api/tasks`;
+            const url = agent ? `${API}/api/tasks?agent=${encodeURIComponent(agent)}` : `${API}/api/tasks`;
             tasks = await fetch(url).then(r => r.json());
             
             // Load comments and action items

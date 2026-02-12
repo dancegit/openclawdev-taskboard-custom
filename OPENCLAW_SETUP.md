@@ -1,4 +1,4 @@
-﻿# 🤖 OPENCLAW Integration Guide
+# 🤖 OPENCLAW Integration Guide
 
 This document explains how to configure OPENCLAW to work with the OPENCLAW Task Board's multi-agent system.
 
@@ -268,6 +268,7 @@ The agent needs to make HTTP calls to the task board. Ensure:
 
 ## Need Help?
 
+- [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - Detailed troubleshooting guide for common issues
 - [OPENCLAW Documentation](https://docs.Molt.bot)
 - [OPENCLAW Discord](https://discord.com/invite/Molt)
 - [GitHub Issues](https://github.com/rizqcon/moltdev-taskboard/issues)
