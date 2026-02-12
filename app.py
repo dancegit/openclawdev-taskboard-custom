@@ -142,7 +142,7 @@ async def notify_OPENCLAW(task_id: int, task_title: str, comment_agent: str, com
             # Use OPENCLAW's cron wake endpoint
             payload = {
                 "action": "wake",
-                "text": f"💬 Task Board: New comment on #{task_id} ({task_title}) from {comment_agent}:\n\n{comment_content[:200]}{'...' if len(comment_content) > 200 else ''}\n\nCheck and respond: http://localhost:8080"
+                "text": f"💬 Task Board: New comment on #{task_id} ({task_title}) from {comment_agent}:\n\n{comment_content[:200]}{'...' if len(comment_content) > 200 else ''}\n\nCheck and respond: http://localhost:18080"
             }
             headers = {
                 "Authorization": f"Bearer {OPENCLAW_TOKEN}",
@@ -222,11 +222,11 @@ You previously worked on this task and moved it to Review. User has a follow-up 
 {system_prompt}
 
 ## Instructions:
-1. Call start-work API: POST http://localhost:8080/api/tasks/{task_id}/start-work?agent={agent_name}
+1. Call start-work API: POST http://localhost:18080/api/tasks/{task_id}/start-work?agent={agent_name}
 2. Read the context and User's question
-3. Respond helpfully by posting a comment: POST http://localhost:8080/api/tasks/{task_id}/comments
+3. Respond helpfully by posting a comment: POST http://localhost:18080/api/tasks/{task_id}/comments
 4. Keep your response focused on what User asked
-5. Call stop-work API: POST http://localhost:8080/api/tasks/{task_id}/stop-work?agent={agent_name}
+5. Call stop-work API: POST http://localhost:18080/api/tasks/{task_id}/stop-work?agent={agent_name}
    - Add &outcome=review&reason=<summary> if work is complete
    - Add &outcome=blocked&reason=<why> if you need more input
 
@@ -313,10 +313,10 @@ async def spawn_mentioned_agent(task_id: int, task_title: str, task_description:
 {system_prompt}
 
 ## Instructions:
-1. Call start-work API: POST http://localhost:8080/api/tasks/{task_id}/start-work?agent={mentioned_agent}
+1. Call start-work API: POST http://localhost:18080/api/tasks/{task_id}/start-work?agent={mentioned_agent}
 2. Review the task from YOUR perspective ({mentioned_agent})
-3. Post your findings/response as a comment: POST http://localhost:8080/api/tasks/{task_id}/comments
-4. Call stop-work API: POST http://localhost:8080/api/tasks/{task_id}/stop-work?agent={mentioned_agent}
+3. Post your findings/response as a comment: POST http://localhost:18080/api/tasks/{task_id}/comments
+4. Call stop-work API: POST http://localhost:18080/api/tasks/{task_id}/stop-work?agent={mentioned_agent}
 
 **Note:** You are NOT the assigned owner of this task. You're providing your expertise because you were tagged.
 Do NOT move the task (no outcome param) — that's the owner's job.
@@ -364,7 +364,7 @@ Respond now with your assessment.
                 # Post system comment about the spawn
                 async with httpx.AsyncClient(timeout=5.0) as comment_client:
                     await comment_client.post(
-                        f"http://localhost:8080/api/tasks/{task_id}/comments",
+                        f"http://localhost:18080/api/tasks/{task_id}/comments",
                         json={
                             "agent": "System",
                             "content": f"📢 **{mentioned_agent}** was tagged by {mentioner} and is now reviewing this task."
@@ -416,11 +416,11 @@ ESCALATION CHAIN:
 4. {HUMAN_SUPERVISOR_LABEL} has final authority on all decisions
 
 TASK BOARD INTEGRATION:
-- Use start-work API when beginning: POST http://localhost:8080/api/tasks/{{task_id}}/start-work?agent={{your_name}}
-- Post updates as comments: POST http://localhost:8080/api/tasks/{{task_id}}/comments (json: {{"agent": "your_name", "content": "message"}})
-- Create action items for questions: POST http://localhost:8080/api/tasks/{{task_id}}/action-items (json: {{"agent": "your_name", "content": "question", "item_type": "question"}})
-- Move to Review when done: POST http://localhost:8080/api/tasks/{{task_id}}/move?status=Review&agent={{your_name}}&reason=...
-- Use stop-work API when finished: POST http://localhost:8080/api/tasks/{{task_id}}/stop-work
+- Use start-work API when beginning: POST http://localhost:18080/api/tasks/{{task_id}}/start-work?agent={{your_name}}
+- Post updates as comments: POST http://localhost:18080/api/tasks/{{task_id}}/comments (json: {{"agent": "your_name", "content": "message"}})
+- Create action items for questions: POST http://localhost:18080/api/tasks/{{task_id}}/action-items (json: {{"agent": "your_name", "content": "question", "item_type": "question"}})
+- Move to Review when done: POST http://localhost:18080/api/tasks/{{task_id}}/move?status=Review&agent={{your_name}}&reason=...
+- Use stop-work API when finished: POST http://localhost:18080/api/tasks/{{task_id}}/stop-work
 
 REPORT FORMAT:
 When complete, post a comment with your findings using this format:
@@ -537,11 +537,11 @@ async def spawn_agent_session(task_id: int, task_title: str, task_description: s
 ---
 
 ## Instructions
-1. Call start-work API: POST http://localhost:8080/api/tasks/{task_id}/start-work?agent={agent_name}
+1. Call start-work API: POST http://localhost:18080/api/tasks/{task_id}/start-work?agent={agent_name}
    - This auto-moves the card to "In Progress" if needed
 2. Analyze the task thoroughly
 3. Post your findings as a comment on the task
-4. When done, call stop-work with outcome: POST http://localhost:8080/api/tasks/{task_id}/stop-work?agent={agent_name}&outcome=review&reason=<summary>
+4. When done, call stop-work with outcome: POST http://localhost:18080/api/tasks/{task_id}/stop-work?agent={agent_name}&outcome=review&reason=<summary>
    - Use outcome=review when work is complete (auto-moves to Review)
    - Use outcome=blocked&reason=<why> if you need input (auto-moves to Blocked)
 
@@ -580,15 +580,16 @@ Begin now.
                 # Add a comment to the task noting the agent was spawned
                 spawn_info = result.get("result", {})
                 run_id = spawn_info.get("runId", "unknown")
-                session_key = spawn_info.get("childSessionKey", None)
-                
+                # CRITICAL FIX: childSessionKey is in details object, not result directly
+                session_key = spawn_info.get("details", {}).get("childSessionKey", None)
+
                 # Save session key to database for follow-up messages
                 if session_key:
                     set_task_session(task_id, session_key)
                 
                 async with httpx.AsyncClient(timeout=5.0) as comment_client:
                     await comment_client.post(
-                        f"http://localhost:8080/api/tasks/{task_id}/comments",
+                        f"http://localhost:18080/api/tasks/{task_id}/comments",
                         json={
                             "agent": "System",
                             "content": f"🤖 **{agent_name}** agent spawned automatically.\n\nSession: `{session_key or 'unknown'}`\nRun ID: `{run_id}`\n\n💬 *Reply to this task and the agent will respond.*"
@@ -812,7 +813,7 @@ app = FastAPI(title="RIZQ Task Board", version="1.2.0")
 
 # Restrict CORS to localhost origins only
 ALLOWED_ORIGINS = [
-    "http://localhost:8080",
+    "http://localhost:18080",
     "http://127.0.0.1:8080",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -1271,8 +1272,57 @@ async def stop_work(task_id: int, agent: str = None, outcome: str = None, reason
         await manager.broadcast({"type": "task_updated", "task": result})
     if action_item:
         await manager.broadcast({"type": "action_item_added", "task_id": task_id, "item": action_item})
-    
+
     return {"status": "stopped", "task_id": task_id, "moved_to": new_status}
+
+@app.post("/api/tasks/{task_id}/spawn-agent")
+async def spawn_agent(task_id: int):
+    """Spawn an agent for a task using auto-spawn mechanism (not @mention).
+
+    This endpoint calls spawn_agent_session() directly, which spawns an agent
+    with ownership instructions (start-work, stay alive for follow-ups, cleanup: keep).
+
+    Use this for auto-spawn systems, not for @mention quick input.
+    """
+    now = datetime.now().isoformat()
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = dict(row)
+
+        # Check if task already has an active session
+        if task.get("agent_session_key") and task.get("status") == "In Progress":
+            return {"status": "already_running", "task_id": task_id, "message": "Task already has an active agent session"}
+
+    # Spawn the agent
+    result = await spawn_agent_session(
+        task_id=task["id"],
+        task_title=task["title"],
+        task_description=task.get("description", ""),
+        agent_name=task["agent"]
+    )
+
+    if result:
+        # Update task to In Progress
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                ("In Progress", now, task_id)
+            )
+            conn.commit()
+            log_activity(task_id, "agent_spawned", task["agent"], "Agent spawned via auto-spawn endpoint", conn=conn)
+
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            result_task = dict(row)
+
+        await manager.broadcast({"type": "task_updated", "task": result_task})
+
+        return {"status": "spawned", "task_id": task_id, "agent": task["agent"]}
+    else:
+        return {"status": "failed", "task_id": task_id, "message": "Failed to spawn agent"}
 
 class MoveRequest(BaseModel):
     status: str
