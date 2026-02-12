@@ -1001,9 +1001,50 @@ def list_tasks(board: str = "tasks", agent: str = None, status: str = None):
             params.append(status)
         
         query += " ORDER BY CASE priority WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END, created_at DESC"
-        
+
         rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+@app.get("/api/tasks/{task_id}/check-health")
+async def check_task_health(task_id: int, _: bool = Depends(verify_api_key)):
+    """
+    Check the health of an agent session for a specific task.
+
+    Returns True if the agent session is active, False otherwise.
+    """
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT id, title, agent, agent_session_key FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        task = cursor.fetchone()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Convert sqlite3.Row to dict
+    task_dict = dict(task)
+    session_key = task_dict.get("agent_session_key")
+    if not session_key or session_key == "unknown" or session_key == "":
+        return {
+            "task_id": task_id,
+            "task_title": task_dict["title"],
+            "agent": task_dict["agent"],
+            "session_key": None,
+            "is_active": False,
+            "message": "No active session key"
+        }
+
+    is_active = await check_agent_session_health(session_key)
+
+    return {
+        "task_id": task_id,
+        "task_title": task_dict["title"],
+        "agent": task_dict["agent"],
+        "session_key": session_key[:50] + "..." if len(session_key) > 50 else session_key,
+        "is_active": is_active,
+        "message": "Agent session is active" if is_active else "Agent session is NOT active (zombie task)"
+    }
 
 @app.get("/api/tasks/{task_id}", response_model=Task)
 def get_task(task_id: int):
@@ -2259,45 +2300,6 @@ async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
         "reset_count": reset_count,
         "message": f"Reset {reset_count} zombie tasks to Backlog",
         "reset_tasks": actual_zombies
-    }
-
-@app.post("/api/tasks/{task_id}/check-health")
-async def check_task_health(task_id: int, _: bool = Depends(verify_api_key)):
-    """
-    Check the health of an agent session for a specific task.
-
-    Returns True if the agent session is active, False otherwise.
-    """
-    with get_db() as conn:
-        cursor = conn.execute(
-            "SELECT id, title, agent, agent_session_key FROM tasks WHERE id = ?",
-            (task_id,)
-        )
-        task = cursor.fetchone()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    session_key = task.get("agent_session_key")
-    if not session_key or session_key == "unknown" or session_key == "":
-        return {
-            "task_id": task_id,
-            "task_title": task["title"],
-            "agent": task["agent"],
-            "session_key": None,
-            "is_active": False,
-            "message": "No active session key"
-        }
-
-    is_active = await check_agent_session_health(session_key)
-
-    return {
-        "task_id": task_id,
-        "task_title": task["title"],
-        "agent": task["agent"],
-        "session_key": session_key[:50] + "..." if len(session_key) > 50 else session_key,
-        "is_active": is_active,
-        "message": "Agent session is active" if is_active else "Agent session is NOT active (zombie task)"
     }
 
 def get_system_stats():
