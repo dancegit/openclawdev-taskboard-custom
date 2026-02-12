@@ -333,8 +333,8 @@ Respond now with your assessment.
                 "args": {
                     "agentId": agent_id,
                     "task": mention_prompt,
-                    "label": f"task-{task_id}-mention-{agent_id}",
-                    "cleanup": "delete"  # Cleanup after since they're just dropping in
+                    "label": f"task-{task_id}-ownership-{agent_id}",
+                    "cleanup": "keep"  # CRITICAL FIX: Keep agents alive for continuous task work (was: delete)
                 }
             }
             headers = {
@@ -987,18 +987,25 @@ def list_tasks(board: str = "tasks", agent: str = None, status: str = None):
     with get_db() as conn:
         query = "SELECT * FROM tasks WHERE board = ?"
         params = [board]
-        
+
         if agent:
             query += " AND agent = ?"
             params.append(agent)
         if status:
             query += " AND status = ?"
             params.append(status)
-        
+
         query += " ORDER BY CASE priority WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END, created_at DESC"
 
         rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        tasks = []
+        for row in rows:
+            task = dict(row)
+            # Ensure status has a default value if NULL
+            if task.get('status') is None:
+                task['status'] = 'Backlog'
+            tasks.append(task)
+        return tasks
 
 @app.get("/api/tasks/{task_id}/check-health")
 async def check_task_health(
@@ -2274,7 +2281,10 @@ def detect_zombie_tasks(minutes_threshold: int = 60) -> list:
     Returns:
         List of zombie task dictionaries
     """
+    print(f"🔍 detect_zombie_tasks() called with threshold={minutes_threshold}")
+
     if not OPENCLAW_ENABLED:
+        print("❌ OPENCLAW_ENABLED is False, returning empty list")
         return []
 
     with get_db() as conn:
@@ -2288,11 +2298,15 @@ def detect_zombie_tasks(minutes_threshold: int = 60) -> list:
         """)
         tasks = cursor.fetchall()
 
+    print(f"📊 Found {len(tasks)} tasks in In Progress with session keys")
+
     zombie_tasks = []
     for task in tasks:
         # Check agent activity by comments
         try:
+            print(f"   Checking task #{task['id']} ({task['title'][:30]}...)")
             activity = check_agent_activity_by_comments(task["id"], minutes_threshold)
+            print(f"      Result: is_zombie={activity['is_zombie']}, minutes={activity.get('minutes_since_activity', 'N/A')}")
 
             if activity["is_zombie"]:
                 task_dict = {
@@ -2308,7 +2322,10 @@ def detect_zombie_tasks(minutes_threshold: int = 60) -> list:
                 zombie_tasks.append(task_dict)
         except Exception as e:
             print(f"❌ Error checking activity for task #{task['id']}: {e}")
+            import traceback
+            traceback.print_exc()
 
+    print(f"✅ Returning {len(zombie_tasks)} zombie tasks")
     return zombie_tasks
 
 @app.get("/api/health/zombie-tasks")
