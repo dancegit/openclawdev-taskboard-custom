@@ -19,3 +19,4 @@ __pycache__/
 
 *.personalized
 migrate-to-postgres.py
+migrate-to-postgres.py
