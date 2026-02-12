@@ -874,9 +874,10 @@ async def agent_health_monitor():
     """
     Background task that monitors agent health every 5 minutes.
 
-    Checks for zombie tasks and logs warnings.
+    Checks for zombie tasks based on COMMENT ACTIVITY (more accurate than CPU or session checks).
     """
     print("🔄 Starting agent health monitor (checks every 5 minutes)")
+    print("📝 Using COMMENT ACTIVITY detection (no comments in last 60 minutes = zombie)")
     while True:
         try:
             await asyncio.sleep(300)  # Check every 5 minutes
@@ -891,35 +892,29 @@ async def agent_health_monitor():
                 )
                 active_agents_count = cursor.fetchone()["count"]
 
-            # Check for zombie tasks
-            zombie_tasks = detect_zombie_tasks()
-            actual_zombies = []
-
-            for task in zombie_tasks:
-                is_healthy = await check_agent_session_health(task["session_key"])
-                if not is_healthy:
-                    actual_zombies.append(task)
+            # Check for zombie tasks (using comment activity)
+            zombie_tasks = detect_zombie_tasks(minutes_threshold=60)
+            zombie_count = len(zombie_tasks)
 
             # Log status
             if active_agents_count > 0:
                 print(f"\n📊 Health Check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"   Active agents: {active_agents_count}")
+                print(f"   Zombie tasks: {zombie_count}/{active_agents_count}")
                 print(f"   CPU usage: {stats['cpu_percent']}%")
                 print(f"   Memory usage: {stats['memory_percent']}%")
-                print(f"   Zombie tasks: {len(actual_zombies)}")
-
-                # Warn if low CPU with active agents
-                if stats["cpu_percent"] < 10:
-                    print(f"   ⚠️ WARNING: Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents")
-                    print(f"   Possible zombie tasks detected. Check /api/health/zombie-tasks")
+                print(f"   Disk usage: {stats['disk_percent']}%")
 
                 # Warn if zombie tasks found
-                if actual_zombies:
-                    print(f"   ⚠️ Zombie tasks detected:")
-                    for task in actual_zombies:
+                if zombie_tasks:
+                    print(f"   ⚠️ Zombie tasks detected (no comments in last 60 minutes):")
+                    for task in zombie_tasks:
                         print(f"      Task #{task['id']}: {task['title'][:50]}...")
                         print(f"         Agent: {task['agent']}")
-                        print(f"         Session: {task['session_key'][:50]}...")
+                        print(f"         Last activity: {task.get('last_activity', 'N/A')[:19]}")
+                        print(f"         Minutes since: {int(task.get('minutes_since_activity', 0))}")
+                else:
+                    print(f"   ✅ All agents active (recent comments)")
 
         except Exception as e:
             print(f"❌ Error in agent health monitor: {e}")
@@ -1006,11 +1001,22 @@ def list_tasks(board: str = "tasks", agent: str = None, status: str = None):
         return [dict(row) for row in rows]
 
 @app.get("/api/tasks/{task_id}/check-health")
-async def check_task_health(task_id: int, _: bool = Depends(verify_api_key)):
+async def check_task_health(
+    task_id: int,
+    minutes_threshold: int = 60,
+    _: bool = Depends(verify_api_key)
+):
     """
     Check the health of an agent session for a specific task.
 
-    Returns True if the agent session is active, False otherwise.
+    Uses COMMENT ACTIVITY detection (more accurate than CPU or session checks).
+
+    Args:
+        task_id: The task ID to check
+        minutes_threshold: How many minutes without activity = zombie (default: 60)
+
+    Returns:
+        Dictionary with agent health status
     """
     with get_db() as conn:
         cursor = conn.execute(
@@ -1032,18 +1038,24 @@ async def check_task_health(task_id: int, _: bool = Depends(verify_api_key)):
             "agent": task_dict["agent"],
             "session_key": None,
             "is_active": False,
-            "message": "No active session key"
+            "message": "No active session key",
+            "detection_method": "session_key"
         }
 
-    is_active = await check_agent_session_health(session_key)
+    # Check activity by comments
+    activity = check_agent_activity_by_comments(task_id, minutes_threshold)
 
     return {
         "task_id": task_id,
         "task_title": task_dict["title"],
         "agent": task_dict["agent"],
         "session_key": session_key[:50] + "..." if len(session_key) > 50 else session_key,
-        "is_active": is_active,
-        "message": "Agent session is active" if is_active else "Agent session is NOT active (zombie task)"
+        "is_active": not activity["is_zombie"],
+        "message": "Agent is active (recent comments)" if not activity["is_zombie"] else f"Agent NOT active (no comments for {int(activity['minutes_since_activity'])} minutes)",
+        "detection_method": "comment_activity",
+        "last_activity": activity["last_activity"],
+        "minutes_since_activity": activity["minutes_since_activity"],
+        "latest_comment": activity.get("latest_comment")
     }
 
 @app.get("/api/tasks/{task_id}", response_model=Task)
@@ -2187,12 +2199,77 @@ async def check_agent_session_health(session_key: str) -> bool:
         print(f"❌ Error checking agent session health: {e}")
         return False
 
-def detect_zombie_tasks() -> list:
+def check_agent_activity_by_comments(task_id: int, minutes_threshold: int = 60) -> dict:
     """
-    Detect tasks with stale session keys (zombie tasks).
+    Check agent activity by looking at recent comments/messages.
 
-    A zombie task is a task in "In Progress" status with an agent_session_key
-    but the actual agent session is not running.
+    This is more accurate than CPU or session checks for cloud-based AI agents.
+
+    Args:
+        task_id: The task ID to check
+        minutes_threshold: How many minutes without activity = zombie (default: 60)
+
+    Returns:
+        Dictionary with activity status and details
+    """
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            SELECT agent, content, created_at
+            FROM comments
+            WHERE task_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (task_id,)
+        )
+        latest_comment = cursor.fetchone()
+
+    if not latest_comment:
+        return {
+            "task_id": task_id,
+            "has_activity": False,
+            "last_activity": None,
+            "minutes_since_activity": None,
+            "is_zombie": True,
+            "message": "No comments found - agent never posted"
+        }
+
+    # Calculate age of latest comment
+    last_activity = datetime.fromisoformat(latest_comment["created_at"])
+    now = datetime.now()
+    minutes_since_activity = (now - last_activity).total_seconds() / 60
+
+    is_zombie = minutes_since_activity > minutes_threshold
+
+    status_msg = "Agent is active" if not is_zombie else f"⚠️ No activity for {int(minutes_since_activity)} minutes"
+
+    return {
+        "task_id": task_id,
+        "has_activity": True,
+        "last_activity": last_activity.isoformat(),
+        "minutes_since_activity": round(minutes_since_activity, 1),
+        "is_zombie": is_zombie,
+        "message": status_msg,
+        "latest_comment": {
+            "agent": latest_comment["agent"],
+            "content": latest_comment["content"][:100],
+            "created_at": latest_comment["created_at"]
+        }
+    }
+
+def detect_zombie_tasks(minutes_threshold: int = 60) -> list:
+    """
+    Detect tasks with no recent agent activity (zombie tasks).
+
+    A zombie task is a task in "In Progress" status where the assigned agent
+    has not posted any comments/messages in the last X minutes.
+
+    This method uses COMMENT ACTIVITY instead of CPU or session checks,
+    which is more accurate for cloud-based AI agents.
+
+    Args:
+        minutes_threshold: How many minutes without activity = zombie (default: 60)
 
     Returns:
         List of zombie task dictionaries
@@ -2213,49 +2290,70 @@ def detect_zombie_tasks() -> list:
 
     zombie_tasks = []
     for task in tasks:
-        task_dict = {
-            "id": task["id"],
-            "title": task["title"],
-            "agent": task["agent"],
-            "session_key": task["agent_session_key"],
-            "updated_at": task["updated_at"]
-        }
-        zombie_tasks.append(task_dict)
+        # Check agent activity by comments
+        try:
+            activity = check_agent_activity_by_comments(task["id"], minutes_threshold)
+
+            if activity["is_zombie"]:
+                task_dict = {
+                    "id": task["id"],
+                    "title": task["title"],
+                    "agent": task["agent"],
+                    "session_key": task["agent_session_key"],
+                    "updated_at": task["updated_at"],
+                    "last_activity": activity["last_activity"],
+                    "minutes_since_activity": activity["minutes_since_activity"],
+                    "detection_method": "comment_activity"
+                }
+                zombie_tasks.append(task_dict)
+        except Exception as e:
+            print(f"❌ Error checking activity for task #{task['id']}: {e}")
 
     return zombie_tasks
 
 @app.get("/api/health/zombie-tasks")
-async def get_zombie_tasks(_: bool = Depends(verify_api_key)):
+async def get_zombie_tasks(
+    minutes_threshold: int = 60,
+    _: bool = Depends(verify_api_key)
+):
     """
-    Get list of zombie tasks (tasks with stale session keys).
+    Get list of zombie tasks (tasks with no recent agent activity).
 
     This endpoint returns tasks that appear "In Progress" but their
-    agent sessions are no longer running.
-    """
-    zombie_tasks = detect_zombie_tasks()
+    agents have not posted any comments in the last X minutes.
 
-    # Check health for each task
-    active_zombies = []
-    for task in zombie_tasks:
-        is_healthy = await check_agent_session_health(task["session_key"])
-        if not is_healthy:
-            active_zombies.append(task)
+    Uses COMMENT ACTIVITY detection (more accurate than CPU or session checks).
+
+    Args:
+        minutes_threshold: How many minutes without activity = zombie (default: 60)
+    """
+    zombie_tasks = detect_zombie_tasks(minutes_threshold)
 
     return {
-        "zombie_count": len(active_zombies),
-        "zombie_tasks": active_zombies,
-        "total_in_progress": len(zombie_tasks)
+        "zombie_count": len(zombie_tasks),
+        "zombie_tasks": zombie_tasks,
+        "total_in_progress": len(zombie_tasks),
+        "detection_method": "comment_activity",
+        "threshold_minutes": minutes_threshold
     }
 
 @app.post("/api/health/reset-zombie-tasks")
-async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
+async def reset_zombie_tasks(
+    minutes_threshold: int = 60,
+    _: bool = Depends(verify_api_key)
+):
     """
     Reset all zombie tasks back to Backlog status.
 
     This clears stale session keys and moves tasks back to Backlog
     so they can be respawned with fresh agent sessions.
+
+    Uses COMMENT ACTIVITY detection (no comments in last X minutes).
+
+    Args:
+        minutes_threshold: How many minutes without activity = zombie (default: 60)
     """
-    zombie_tasks = detect_zombie_tasks()
+    zombie_tasks = detect_zombie_tasks(minutes_threshold)
 
     if not zombie_tasks:
         return {
@@ -2263,23 +2361,10 @@ async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
             "message": "No zombie tasks found"
         }
 
-    # Check which tasks are actually zombies
-    actual_zombies = []
-    for task in zombie_tasks:
-        is_healthy = await check_agent_session_health(task["session_key"])
-        if not is_healthy:
-            actual_zombies.append(task)
-
-    if not actual_zombies:
-        return {
-            "reset_count": 0,
-            "message": "No active zombie tasks found"
-        }
-
     # Reset zombie tasks to Backlog
     reset_count = 0
     with get_db() as conn:
-        for task in actual_zombies:
+        for task in zombie_tasks:
             task_id = task["id"]
             # Clear session key
             conn.execute(
@@ -2291,7 +2376,13 @@ async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
                 "UPDATE tasks SET status = 'Backlog', updated_at = ? WHERE id = ?",
                 (datetime.now().isoformat(), task_id)
             )
-            log_activity(task_id, "reset_zombie", "System", f"Zombie task detected and reset to Backlog", conn)
+            log_activity(
+                task_id,
+                "reset_zombie",
+                "System",
+                f"Zombie task detected (no activity for {int(task.get('minutes_since_activity', 0))} minutes) and reset to Backlog",
+                conn
+            )
             reset_count += 1
 
         conn.commit()
@@ -2299,7 +2390,9 @@ async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
     return {
         "reset_count": reset_count,
         "message": f"Reset {reset_count} zombie tasks to Backlog",
-        "reset_tasks": actual_zombies
+        "reset_tasks": zombie_tasks,
+        "detection_method": "comment_activity",
+        "threshold_minutes": minutes_threshold
     }
 
 def get_system_stats():
@@ -2355,39 +2448,56 @@ async def get_system_health(_: bool = Depends(verify_api_key)):
     Get system resource usage and health status.
 
     Returns CPU, memory, and disk usage statistics.
-    Can be used to detect if agents are actually working (CPU should be >10% with active agents).
+    Agent activity is detected via COMMENT ACTIVITY (more accurate than CPU for cloud-based agents).
     """
     stats = get_system_stats()
 
-    # Get count of active agents
+    # Get count of active agents and detect zombies
     with get_db() as conn:
         cursor = conn.execute(
             "SELECT COUNT(*) as count FROM tasks WHERE status = 'In Progress' AND agent_session_key IS NOT NULL"
         )
         active_agents_count = cursor.fetchone()["count"]
 
+    # Detect zombie tasks by comment activity
+    zombie_tasks = detect_zombie_tasks(minutes_threshold=60)
+    zombie_count = len(zombie_tasks)
+
     # Analysis
     analysis = {
         "cpu_status": "normal",
         "memory_status": "normal",
         "disk_status": "normal",
-        "agent_activity_status": "unknown"
+        "agent_activity_status": "active"
     }
 
-    # CPU analysis (should be >10% with active agents)
+    # CPU analysis (informational only, not used for zombie detection)
+    if stats["cpu_percent"] < 10:
+        analysis["cpu_status"] = "low"
+        analysis["cpu_message"] = f"ℹ️ Low CPU ({stats['cpu_percent']}%)"
+    elif stats["cpu_percent"] < 50:
+        analysis["cpu_status"] = "normal"
+        analysis["cpu_message"] = f"✅ Normal CPU ({stats['cpu_percent']}%)"
+    else:
+        analysis["cpu_status"] = "high"
+        analysis["cpu_message"] = f"⚠️ High CPU ({stats['cpu_percent']}%)"
+
+    # Agent activity analysis (using comment activity, NOT CPU)
     if active_agents_count > 0:
-        if stats["cpu_percent"] < 10:
-            analysis["cpu_status"] = "warning"
-            analysis["agent_activity_status"] = "zombie_tasks_suspected"
-            analysis["cpu_message"] = f"⚠️ Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents. Possible zombie tasks."
-        elif stats["cpu_percent"] < 20:
-            analysis["cpu_status"] = "low"
-            analysis["agent_activity_status"] = "low_activity"
-            analysis["cpu_message"] = f"⚠️ Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents."
+        if zombie_count > 0:
+            analysis["agent_activity_status"] = "zombie_tasks_detected"
+            analysis["activity_message"] = f"⚠️ {zombie_count}/{active_agents_count} agents are zombies (no comments in last 60 minutes)"
         else:
-            analysis["cpu_status"] = "healthy"
             analysis["agent_activity_status"] = "active"
-            analysis["cpu_message"] = f"✅ Healthy CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents."
+            analysis["activity_message"] = f"✅ All {active_agents_count} agents are active (recent comments)"
+
+    # Zombie task detection message
+    if zombie_count > 0:
+        analysis["agent_activity_status"] = "zombie_tasks_detected"
+        analysis["activity_message"] = f"⚠️ {zombie_count}/{active_agents_count} agents are zombies (no comments in last 60 minutes). Check /api/health/zombie-tasks for details."
+    elif active_agents_count > 0:
+        analysis["agent_activity_status"] = "active"
+        analysis["activity_message"] = f"✅ All {active_agents_count} agents are active (recent comments)"
 
     # Memory analysis
     if stats["memory_percent"] > 90:
@@ -2421,31 +2531,54 @@ async def get_system_health(_: bool = Depends(verify_api_key)):
 def generate_health_recommendations(stats, analysis, active_agents):
     """
     Generate health recommendations based on system state.
+
+    Uses COMMENT ACTIVITY for agent detection (more accurate than CPU).
     """
     recommendations = []
 
-    if analysis.get("agent_activity_status") == "zombie_tasks_suspected":
+    # Zombie task detection (using comment activity, not CPU)
+    if analysis.get("agent_activity_status") == "zombie_tasks_detected":
         recommendations.append({
             "type": "warning",
-            "message": "Low CPU usage with active agents suggests zombie tasks. Check /api/health/zombie-tasks."
+            "message": f"Zombie tasks detected. {active_agents - analysis.get('active_count', 0)} agents have no comments in last 60 minutes. Check /api/health/zombie-tasks for details."
         })
 
-    if stats["memory_percent"] > 80:
+    # Memory analysis
+    if stats["memory_percent"] > 90:
+        recommendations.append({
+            "type": "critical",
+            "message": f"🔴 Critical memory usage: {stats['memory_percent']}%. Restart services immediately."
+        })
+    elif stats["memory_percent"] > 80:
         recommendations.append({
             "type": "warning",
-            "message": f"High memory usage ({stats['memory_percent']}%). Consider clearing old logs or restarting services."
+            "message": f"⚠️ High memory usage ({stats['memory_percent']}%). Consider clearing old logs or restarting services."
         })
 
-    if stats["disk_percent"] > 80:
+    # Disk analysis
+    if stats["disk_percent"] > 90:
+        recommendations.append({
+            "type": "critical",
+            "message": f"🔴 Critical disk usage: {stats['disk_percent']}%. Clean up files immediately."
+        })
+    elif stats["disk_percent"] > 80:
         recommendations.append({
             "type": "warning",
-            "message": f"High disk usage ({stats['disk_percent']}%). Consider cleaning up old files or expanding storage."
+            "message": f"⚠️ High disk usage ({stats['disk_percent']}%). Consider cleaning up old files or expanding storage."
         })
 
+    # High CPU analysis (informational, not a zombie indicator for cloud agents)
+    if stats["cpu_percent"] > 80:
+        recommendations.append({
+            "type": "warning",
+            "message": f"⚠️ High CPU usage ({stats['cpu_percent']}%). Check for runaway processes."
+        })
+
+    # No issues
     if not recommendations:
         recommendations.append({
             "type": "info",
-            "message": "System health is good. No immediate issues detected."
+            "message": "✅ System health is good. All agents active with recent comments."
         })
 
     return recommendations
