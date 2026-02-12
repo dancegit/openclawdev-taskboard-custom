@@ -1,4 +1,6 @@
 # Environment secrets - NEVER COMMIT
+*.db
+*.backup
 .env
 *.env
 
