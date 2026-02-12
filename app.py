@@ -8,6 +8,7 @@ import json
 import asyncio
 import re
 import httpx
+import psutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Set
@@ -864,6 +865,70 @@ app.add_middleware(IPRestrictionMiddleware)
 @app.on_event("startup")
 def startup():
     init_db()
+
+# =============================================================================
+# BACKGROUND MONITORING TASK
+# =============================================================================
+
+async def agent_health_monitor():
+    """
+    Background task that monitors agent health every 5 minutes.
+
+    Checks for zombie tasks and logs warnings.
+    """
+    print("🔄 Starting agent health monitor (checks every 5 minutes)")
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+
+            # Get system stats
+            stats = get_system_stats()
+
+            # Get active agents count
+            with get_db() as conn:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) as count FROM tasks WHERE status = 'In Progress' AND agent_session_key IS NOT NULL"
+                )
+                active_agents_count = cursor.fetchone()["count"]
+
+            # Check for zombie tasks
+            zombie_tasks = detect_zombie_tasks()
+            actual_zombies = []
+
+            for task in zombie_tasks:
+                is_healthy = await check_agent_session_health(task["session_key"])
+                if not is_healthy:
+                    actual_zombies.append(task)
+
+            # Log status
+            if active_agents_count > 0:
+                print(f"\n📊 Health Check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Active agents: {active_agents_count}")
+                print(f"   CPU usage: {stats['cpu_percent']}%")
+                print(f"   Memory usage: {stats['memory_percent']}%")
+                print(f"   Zombie tasks: {len(actual_zombies)}")
+
+                # Warn if low CPU with active agents
+                if stats["cpu_percent"] < 10:
+                    print(f"   ⚠️ WARNING: Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents")
+                    print(f"   Possible zombie tasks detected. Check /api/health/zombie-tasks")
+
+                # Warn if zombie tasks found
+                if actual_zombies:
+                    print(f"   ⚠️ Zombie tasks detected:")
+                    for task in actual_zombies:
+                        print(f"      Task #{task['id']}: {task['title'][:50]}...")
+                        print(f"         Agent: {task['agent']}")
+                        print(f"         Session: {task['session_key'][:50]}...")
+
+        except Exception as e:
+            print(f"❌ Error in agent health monitor: {e}")
+
+# Start background monitor on startup
+@app.on_event("startup")
+async def start_background_monitor():
+    """Start the agent health monitor background task."""
+    asyncio.create_task(agent_health_monitor())
 
 # Serve static files
 STATIC_PATH.mkdir(exist_ok=True)
@@ -2033,6 +2098,359 @@ def get_chat_history(limit: int = 100, session: str = "main"):
                 msg["attachments"] = json.loads(row["attachments"])
             messages.append(msg)
         return {"history": messages, "session": session}
+
+# =============================================================================
+# AGENT HEALTH MONITORING
+# =============================================================================
+
+async def check_agent_session_health(session_key: str) -> bool:
+    """
+    Check if an agent session is still active by calling sessions_list.
+
+    Args:
+        session_key: The agent session key to check
+
+    Returns:
+        True if session is active, False otherwise
+    """
+    if not OPENCLAW_ENABLED:
+        print(f"⚠️ OpenClaw not enabled, cannot check session health")
+        return False
+
+    try:
+        # Use sessions_list tool to check if session exists
+        # For now, we'll check via HTTP to the sessions endpoint
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{OPENCLAW_GATEWAY_URL}/api/sessions",
+                headers={"Authorization": f"Bearer {OPENCLAW_TOKEN}"}
+            )
+
+        if response.status_code == 200:
+            sessions = response.json()
+            # Check if session_key exists in active sessions
+            active_sessions = sessions.get("sessions", [])
+            session_found = any(s.get("key") == session_key for s in active_sessions)
+
+            if session_found:
+                print(f"✅ Session {session_key[:30]}... is ACTIVE")
+            else:
+                print(f"⚠️ Session {session_key[:30]}... is NOT ACTIVE")
+
+            return session_found
+        else:
+            print(f"❌ Failed to check session health: HTTP {response.status_code}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Error checking agent session health: {e}")
+        return False
+
+def detect_zombie_tasks() -> list:
+    """
+    Detect tasks with stale session keys (zombie tasks).
+
+    A zombie task is a task in "In Progress" status with an agent_session_key
+    but the actual agent session is not running.
+
+    Returns:
+        List of zombie task dictionaries
+    """
+    if not OPENCLAW_ENABLED:
+        return []
+
+    with get_db() as conn:
+        cursor = conn.execute("""
+            SELECT id, title, agent, agent_session_key, updated_at
+            FROM tasks
+            WHERE status = 'In Progress'
+            AND agent_session_key IS NOT NULL
+            AND agent_session_key != 'unknown'
+            AND agent_session_key != ''
+        """)
+        tasks = cursor.fetchall()
+
+    zombie_tasks = []
+    for task in tasks:
+        task_dict = {
+            "id": task["id"],
+            "title": task["title"],
+            "agent": task["agent"],
+            "session_key": task["agent_session_key"],
+            "updated_at": task["updated_at"]
+        }
+        zombie_tasks.append(task_dict)
+
+    return zombie_tasks
+
+@app.get("/api/health/zombie-tasks")
+async def get_zombie_tasks(_: bool = Depends(verify_api_key)):
+    """
+    Get list of zombie tasks (tasks with stale session keys).
+
+    This endpoint returns tasks that appear "In Progress" but their
+    agent sessions are no longer running.
+    """
+    zombie_tasks = detect_zombie_tasks()
+
+    # Check health for each task
+    active_zombies = []
+    for task in zombie_tasks:
+        is_healthy = await check_agent_session_health(task["session_key"])
+        if not is_healthy:
+            active_zombies.append(task)
+
+    return {
+        "zombie_count": len(active_zombies),
+        "zombie_tasks": active_zombies,
+        "total_in_progress": len(zombie_tasks)
+    }
+
+@app.post("/api/health/reset-zombie-tasks")
+async def reset_zombie_tasks(_: bool = Depends(verify_api_key)):
+    """
+    Reset all zombie tasks back to Backlog status.
+
+    This clears stale session keys and moves tasks back to Backlog
+    so they can be respawned with fresh agent sessions.
+    """
+    zombie_tasks = detect_zombie_tasks()
+
+    if not zombie_tasks:
+        return {
+            "reset_count": 0,
+            "message": "No zombie tasks found"
+        }
+
+    # Check which tasks are actually zombies
+    actual_zombies = []
+    for task in zombie_tasks:
+        is_healthy = await check_agent_session_health(task["session_key"])
+        if not is_healthy:
+            actual_zombies.append(task)
+
+    if not actual_zombies:
+        return {
+            "reset_count": 0,
+            "message": "No active zombie tasks found"
+        }
+
+    # Reset zombie tasks to Backlog
+    reset_count = 0
+    with get_db() as conn:
+        for task in actual_zombies:
+            task_id = task["id"]
+            # Clear session key
+            conn.execute(
+                "UPDATE tasks SET agent_session_key = NULL, working_agent = NULL WHERE id = ?",
+                (task_id,)
+            )
+            # Move to Backlog
+            conn.execute(
+                "UPDATE tasks SET status = 'Backlog', updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), task_id)
+            )
+            log_activity(task_id, "reset_zombie", "System", f"Zombie task detected and reset to Backlog", conn)
+            reset_count += 1
+
+        conn.commit()
+
+    return {
+        "reset_count": reset_count,
+        "message": f"Reset {reset_count} zombie tasks to Backlog",
+        "reset_tasks": actual_zombies
+    }
+
+@app.post("/api/tasks/{task_id}/check-health")
+async def check_task_health(task_id: int, _: bool = Depends(verify_api_key)):
+    """
+    Check the health of an agent session for a specific task.
+
+    Returns True if the agent session is active, False otherwise.
+    """
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT id, title, agent, agent_session_key FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        task = cursor.fetchone()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    session_key = task.get("agent_session_key")
+    if not session_key or session_key == "unknown" or session_key == "":
+        return {
+            "task_id": task_id,
+            "task_title": task["title"],
+            "agent": task["agent"],
+            "session_key": None,
+            "is_active": False,
+            "message": "No active session key"
+        }
+
+    is_active = await check_agent_session_health(session_key)
+
+    return {
+        "task_id": task_id,
+        "task_title": task["title"],
+        "agent": task["agent"],
+        "session_key": session_key[:50] + "..." if len(session_key) > 50 else session_key,
+        "is_active": is_active,
+        "message": "Agent session is active" if is_active else "Agent session is NOT active (zombie task)"
+    }
+
+def get_system_stats():
+    """
+    Get current system resource usage statistics.
+
+    Returns:
+        Dictionary with CPU, memory, and disk usage
+    """
+    try:
+        # CPU usage (last 5 seconds average)
+        cpu_percent = psutil.cpu_percent(interval=1)
+
+        # Memory usage
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        memory_used_gb = memory.used / (1024**3)
+        memory_total_gb = memory.total / (1024**3)
+
+        # Disk usage
+        disk = psutil.disk_usage('/')
+        disk_percent = disk.percent
+        disk_used_gb = disk.used / (1024**3)
+        disk_total_gb = disk.total / (1024**3)
+
+        return {
+            "cpu_percent": cpu_percent,
+            "memory_percent": memory_percent,
+            "memory_used_gb": round(memory_used_gb, 2),
+            "memory_total_gb": round(memory_total_gb, 2),
+            "disk_percent": disk_percent,
+            "disk_used_gb": round(disk_used_gb, 2),
+            "disk_total_gb": round(disk_total_gb, 2),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        print(f"❌ Error getting system stats: {e}")
+        return {
+            "cpu_percent": 0,
+            "memory_percent": 0,
+            "memory_used_gb": 0,
+            "memory_total_gb": 0,
+            "disk_percent": 0,
+            "disk_used_gb": 0,
+            "disk_total_gb": 0,
+            "timestamp": datetime.now().isoformat(),
+            "error": str(e)
+        }
+
+@app.get("/api/health/system")
+async def get_system_health(_: bool = Depends(verify_api_key)):
+    """
+    Get system resource usage and health status.
+
+    Returns CPU, memory, and disk usage statistics.
+    Can be used to detect if agents are actually working (CPU should be >10% with active agents).
+    """
+    stats = get_system_stats()
+
+    # Get count of active agents
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT COUNT(*) as count FROM tasks WHERE status = 'In Progress' AND agent_session_key IS NOT NULL"
+        )
+        active_agents_count = cursor.fetchone()["count"]
+
+    # Analysis
+    analysis = {
+        "cpu_status": "normal",
+        "memory_status": "normal",
+        "disk_status": "normal",
+        "agent_activity_status": "unknown"
+    }
+
+    # CPU analysis (should be >10% with active agents)
+    if active_agents_count > 0:
+        if stats["cpu_percent"] < 10:
+            analysis["cpu_status"] = "warning"
+            analysis["agent_activity_status"] = "zombie_tasks_suspected"
+            analysis["cpu_message"] = f"⚠️ Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents. Possible zombie tasks."
+        elif stats["cpu_percent"] < 20:
+            analysis["cpu_status"] = "low"
+            analysis["agent_activity_status"] = "low_activity"
+            analysis["cpu_message"] = f"⚠️ Low CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents."
+        else:
+            analysis["cpu_status"] = "healthy"
+            analysis["agent_activity_status"] = "active"
+            analysis["cpu_message"] = f"✅ Healthy CPU ({stats['cpu_percent']}%) with {active_agents_count} active agents."
+
+    # Memory analysis
+    if stats["memory_percent"] > 90:
+        analysis["memory_status"] = "critical"
+        analysis["memory_message"] = f"🔴 Critical memory usage: {stats['memory_percent']}%"
+    elif stats["memory_percent"] > 80:
+        analysis["memory_status"] = "warning"
+        analysis["memory_message"] = f"⚠️ High memory usage: {stats['memory_percent']}%"
+    else:
+        analysis["memory_status"] = "normal"
+        analysis["memory_message"] = f"✅ Normal memory usage: {stats['memory_percent']}%"
+
+    # Disk analysis
+    if stats["disk_percent"] > 90:
+        analysis["disk_status"] = "critical"
+        analysis["disk_message"] = f"🔴 Critical disk usage: {stats['disk_percent']}%"
+    elif stats["disk_percent"] > 80:
+        analysis["disk_status"] = "warning"
+        analysis["disk_message"] = f"⚠️ High disk usage: {stats['disk_percent']}%"
+    else:
+        analysis["disk_status"] = "normal"
+        analysis["disk_message"] = f"✅ Normal disk usage: {stats['disk_percent']}%"
+
+    return {
+        "system_stats": stats,
+        "active_agents": active_agents_count,
+        "analysis": analysis,
+        "recommendations": generate_health_recommendations(stats, analysis, active_agents_count)
+    }
+
+def generate_health_recommendations(stats, analysis, active_agents):
+    """
+    Generate health recommendations based on system state.
+    """
+    recommendations = []
+
+    if analysis.get("agent_activity_status") == "zombie_tasks_suspected":
+        recommendations.append({
+            "type": "warning",
+            "message": "Low CPU usage with active agents suggests zombie tasks. Check /api/health/zombie-tasks."
+        })
+
+    if stats["memory_percent"] > 80:
+        recommendations.append({
+            "type": "warning",
+            "message": f"High memory usage ({stats['memory_percent']}%). Consider clearing old logs or restarting services."
+        })
+
+    if stats["disk_percent"] > 80:
+        recommendations.append({
+            "type": "warning",
+            "message": f"High disk usage ({stats['disk_percent']}%). Consider cleaning up old files or expanding storage."
+        })
+
+    if not recommendations:
+        recommendations.append({
+            "type": "info",
+            "message": "System health is good. No immediate issues detected."
+        })
+
+    return recommendations
+
+# =============================================================================
+# JARVIS INTEGRATION
+# =============================================================================
 
 @app.post("/api/jarvis/chat")
 async def chat_with_jarvis(msg: JarvisMessage):
