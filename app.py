@@ -42,19 +42,26 @@ HUMAN_NAME = os.getenv("HUMAN_NAME", "User")
 HUMAN_SUPERVISOR_LABEL = os.getenv("HUMAN_SUPERVISOR_LABEL", "User")
 BOARD_TITLE = os.getenv("BOARD_TITLE", "Task Board")
 
-AGENTS = [MAIN_AGENT_NAME, "Architect", "Security Auditor", "Code Reviewer", "UX Manager", "User", "Unassigned"]
-STATUSES = ["Backlog", "In Progress", "Review", "Done", "Blocked"]
-PRIORITIES = ["Critical", "High", "Medium", "Low"]
-
 # Map task board agent names to OpenClaw agent IDs
 # Customize these to match your OpenClaw agent configuration
 AGENT_TO_OPENCLAW_ID = {
     MAIN_AGENT_NAME: "main",  # Main agent (handles command bar chat)
+    # Layer 1: Analysis & Design Agents
     "Architect": "architect",
     "Security Auditor": "security-auditor",
     "Code Reviewer": "code-reviewer",
     "UX Manager": "ux-manager",
+    # Layer 2: Implementation Agents
+    "Frontend Developer": "frontend-dev",
+    "Backend Developer": "backend-dev",
+    "Data Engineer": "data-engineer",
+    "DevOps Engineer": "devops-engineer",
 }
+
+# Build AGENTS list from AGENT_TO_OPENCLAW_ID keys plus system agents
+AGENTS = list(AGENT_TO_OPENCLAW_ID.keys()) + ["User", "Unassigned"]
+STATUSES = ["Backlog", "In Progress", "Review", "Done", "Deployed", "Blocked"]
+PRIORITIES = ["Critical", "High", "Medium", "Low"]
 
 # Alias for backward compatibility
 AGENT_TO_OPENCLAW_ID = AGENT_TO_OPENCLAW_ID
@@ -388,9 +395,14 @@ FILESYSTEM BOUNDARIES:
 - ONLY access: {ALLOWED_PATHS}
 - Everything else is FORBIDDEN without explicit authorization
 
+ALLOWED ACTIONS (no approval required):
+- git add: Stage files for commit
+- git commit: Create commits with clear messages
+- git push: Push to origin/dev branch
+- Write/modify files in authorized paths
+
 FORBIDDEN ACTIONS (do not attempt without approval):
 - Browser tool (except UX Manager on localhost only)
-- git commit (requires safeword from User)
 - Any action outside the authorized paths
 
 WEB_FETCH (requires approval):
@@ -507,7 +519,91 @@ ALLOWED URLs (localhost only):
 - http://localhost:* (any port)
 - http://127.0.0.1:*
 
-DO NOT navigate to any external URLs. Your browser access is strictly for reviewing the local app."""
+DO NOT navigate to any external URLs. Your browser access is strictly for reviewing the local app.""",
+
+    "frontend-dev": f"""You are the Frontend Developer for {COMPANY_NAME}.
+
+Your focus:
+- UI implementation (React, Vue, or plain HTML/CSS/JS)
+- Mobile-first responsive design
+- Component architecture and reusability
+- State management and data flow
+- Cross-browser compatibility
+
+Project: {PROJECT_NAME}
+You have WRITE access to the codebase. You can:
+- Edit files in the unified repository
+- Commit changes with git
+- Push to GitHub
+
+When completing a task:
+1. Write and test the code
+2. Commit with descriptive message (e.g., "feat: add mobile responsive design (Task #30)")
+3. Push to GitHub
+4. Add comment with commit SHA""",
+
+    "backend-dev": f"""You are the Backend Developer for {COMPANY_NAME}.
+
+Your focus:
+- API implementation and endpoints
+- Business logic and validation
+- Database queries and data access
+- Authentication and authorization
+- API documentation
+
+Project: {PROJECT_NAME}
+You have WRITE access to the codebase. You can:
+- Edit files in the unified repository
+- Commit changes with git
+- Push to GitHub
+
+When completing a task:
+1. Write and test the code
+2. Commit with descriptive message (e.g., "feat: add authentication endpoint (Task #31)")
+3. Push to GitHub
+4. Add comment with commit SHA""",
+
+    "data-engineer": f"""You are the Data Engineer for {COMPANY_NAME}.
+
+Your focus:
+- Data pipeline implementation
+- ETL processes and data transformations
+- Valkey event integration
+- Data validation and quality checks
+- Performance optimization
+
+Project: {PROJECT_NAME}
+You have WRITE access to the codebase. You can:
+- Edit files in the unified repository
+- Commit changes with git
+- Push to GitHub
+
+When completing a task:
+1. Write and test the code
+2. Commit with descriptive message (e.g., "feat: add Valkey event consumer (Task #32)")
+3. Push to GitHub
+4. Add comment with commit SHA""",
+
+    "devops-engineer": f"""You are the DevOps Engineer for {COMPANY_NAME}.
+
+Your focus:
+- Infrastructure as code (Terraform, Docker Compose)
+- CI/CD pipeline configuration
+- Monitoring and alerting setup
+- Security hardening
+- Performance optimization
+
+Project: {PROJECT_NAME}
+You have WRITE access to the codebase. You can:
+- Edit files in the unified repository
+- Commit changes with git
+- Push to GitHub
+
+When completing a task:
+1. Write and test the code
+2. Commit with descriptive message (e.g., "feat: add CI/CD pipeline (Task #33)")
+3. Push to GitHub
+4. Add comment with commit SHA"""
 }
 
 async def spawn_agent_session(task_id: int, task_title: str, task_description: str, agent_name: str):
@@ -1532,6 +1628,27 @@ async def add_comment(task_id: int, comment: CommentCreate):
             "content": comment.content,
             "created_at": now
         }
+        
+        # COMPLETION DETECTION: Auto-move to Review if agent indicates completion
+        task_moved = None
+        if comment.agent != "User" and task_status == "In Progress":
+            content_lower = comment.content.lower()
+            completion_keywords = ["complete", "finished", "done", "ready for review", "implementation complete", "ready", "completed"]
+            if any(keyword in content_lower for keyword in completion_keywords):
+                # Auto-move task to Review
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    ("Review", now, task_id)
+                )
+                conn.commit()
+                task_moved = "Review"
+                log_activity(task_id, "auto_moved_to_review", comment.agent, "Auto-moved based on completion keyword in comment", conn=conn)
+                
+                # Get updated task for broadcast
+                updated_task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if updated_task_row:
+                    updated_task = dict(updated_task_row)
+                    await manager.broadcast({"type": "task_updated", "task": updated_task})
         
         # Auto-clear working_agent when an agent (not User) posts a comment
         # This ensures the "thinking" indicator clears when agent responds

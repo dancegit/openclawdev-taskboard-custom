@@ -15,4 +15,5 @@ VOLUME /app/data
 
 # Run
 EXPOSE 8080
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# DEV MODE: --reload for hot reloading (remove for production)
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]

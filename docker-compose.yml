@@ -8,11 +8,13 @@ services:
     volumes:
       - ./data:/app/data
       - ./static:/app/static
+      - ./app.py:/app/app.py  # DEV: Hot reload for backend code
+      - ./sync-to-neondb.py:/app/sync-to-neondb.py  # SQLite to NeonDB sync script
     env_file:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
       - OPENCLAW_ENABLED=true
-      - OPENCLAW_GATEWAY_URL=http://host.docker.internal:18789
+      - OPENCLAW_GATEWAY_URL=http://10.0.4.1:18789
     extra_hosts:
       - "host.docker.internal:host-gateway"

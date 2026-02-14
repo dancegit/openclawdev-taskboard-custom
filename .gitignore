@@ -1,9 +1,14 @@
 # Environment secrets - NEVER COMMIT
 *.db
-*.backup
+*.backup*
 .env
 *.env
-
+*sync-*
+*test*
+*sync*
+*backup*
+*bak*
+*recommended*
 # Database
 data/
 
@@ -20,3 +25,5 @@ __pycache__/
 *.personalized
 migrate-to-postgres.py
 migrate-to-postgres.py
+# Agent Logger logs
+.opencode/logs/
